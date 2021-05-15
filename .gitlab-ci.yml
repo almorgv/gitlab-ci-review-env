@@ -1,0 +1,531 @@
+stages:
+  - make-version
+  - collect-versions
+  - lint
+  - build
+  - helm-chart
+  - helm-chart-main
+  - test-review-deploy
+  - review
+  - qa
+  - staging
+  - production
+
+include:
+  - '/.apps-ci.yml'
+
+.branch-triggers-build:
+  only:
+    refs:
+      - merge_requests
+      - develop
+  except:
+    variables:
+      - $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME == "release-candidate"
+
+.branch-triggers-deploy:
+  only:
+    refs:
+      - merge_requests
+      - master
+      - develop
+      - tags
+  except:
+    variables:
+      - $CI_COMMIT_TAG && $CI_COMMIT_TAG !~ /^v(([0-9])+\.*([0-9])+)$/
+
+.docker-variables:
+  variables:
+    CI_REGISTRY_IMAGE: $CI_REGISTRY/$CI_PROJECT_PATH/$SERVICE_NAME
+    CI_REGISTRY_IMAGE_TAG: $CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
+
+.helm-variables:
+  extends: .docker-variables
+  variables:
+    HELM_CHART_NAME: $SERVICE_NAME
+    HELM_CHART_PATH: $SERVICE_DIRPATH/chart/$SERVICE_NAME
+    HELM_RELEASE_NAME: $SERVICE_NAME
+
+.helm-main-chart-variables:
+  variables:
+    HELM_CHART_NAME: system
+    HELM_CHART_PATH: chart/system
+    HELM_RELEASE_NAME: $CI_COMMIT_REF_SLUG
+
+.version-variables:
+  variables:
+    APP_VERSION_FILE_NAME: VERSION
+    APP_VERSION_FILE_PATH: $SERVICE_DIRPATH/$APP_VERSION_FILE_NAME
+
+.version-main-chart-variables:
+  extends: .version-variables
+  variables:
+    APP_VERSION_FILE_PATH: $APP_VERSION_FILE_NAME
+
+.ci-util-funcs: &ci-util-funcs
+  - |
+    git config --global http.sslVerify false
+
+    # Workaround for missing tags https://gitlab.com/gitlab-org/gitaly/-/issues/2221
+    git fetch --tags >&2
+
+    function get_current_commit_version_from_tag {
+      set -e
+      local TAG=$1
+      local TARGET_BRANCH=$2
+      echo "get_current_commit_version_from_tag: $TAG..$TARGET_BRANCH" >&2
+
+      # parse paths which changes triggers a pipeline for the particular service
+      # to calculate rev-list for changes in these paths
+      if [ -n "$SERVICE_DIRPATH" ]; then
+        REVISION_PATHS=$(cat $CI_PROJECT_DIR/$SERVICE_DIRPATH/.gitlab-ci.yml \
+          | tr '\n' '\r' \
+          | sed -r "s/(.*)(\.tpl\-triggers\-$SERVICE_NAME\:\r  only\:\r    changes\:\r)((      - )(.*)\r)*(\r\.tpl.*)/\3/" \
+          | tr '\r' '\n' \
+          | cut -d"-" -f2- \
+          | cut -d"*" -f-1 \
+          | tr -d " '" \
+          | awk -v prefix="$CI_PROJECT_DIR/" '{print prefix $0}' \
+          | tr '\n' ' ')
+      fi
+
+      echo "REVISION_PATHS=$REVISION_PATHS" >&2
+
+      local GIT_REV_LIST_ARGS="$TAG..$TARGET_BRANCH --no-merges -- $REVISION_PATHS"
+
+      if [[ "$DEBUG_VERSION" == true ]]; then
+        echo "Revs $TAG..$TARGET_BRANCH:" >&2
+        git rev-list $GIT_REV_LIST_ARGS | xargs -r git show --stat --oneline | cat >&2
+      fi
+
+      local CURRENT_PATCH_NUMBER=$(git rev-list --count $GIT_REV_LIST_ARGS)
+
+      # Calculate current version
+      # trim 'v' prefix and patch suffix from tag if exists
+      # [0.1|0.1.0|v0.1|v0.1.0] -> 0.1
+      # and then add a correct patch number from calculated revs count
+      CURRENT_VER=$(echo $TAG | tr -d "v" | cut -d . -f-2).$CURRENT_PATCH_NUMBER
+
+      # if runs in context of ordinary mr
+      # then make prerelease version by bumping patch and adding prerelease postfix
+      if [ -n "$CI_MERGE_REQUEST_IID" ] && [[ "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" != master ]]; then
+        local CUTTED_REF_SLUG=`echo $CI_COMMIT_REF_SLUG | cut -d"-" -f2-`
+        local SEMVER_PREID=${CUTTED_REF_SLUG::35}-$CI_COMMIT_SHORT_SHA
+        VER_TO_INC=`$CI_PROJECT_DIR/semver bump patch $CURRENT_VER`
+        CURRENT_VER=`$CI_PROJECT_DIR/semver bump prerel $SEMVER_PREID $VER_TO_INC`
+      fi
+
+      echo "CURRENT_VER=$CURRENT_VER" >&2
+      echo "$CURRENT_VER"
+    }
+
+    function get_current_commit_version {
+      set -e
+      LATEST_TAG_BEFORE=$(get_latest_tag_before_commit)
+      local TARGET=$CI_COMMIT_SHORT_SHA
+      VERSION=$(get_current_commit_version_from_tag $LATEST_TAG_BEFORE $TARGET)
+      echo "$VERSION"
+    }
+
+    function get_all_tags_before_commit {
+      local ALL_TAGS=$(git tag --no-contains=$CI_COMMIT_SHA --sort="committerdate" --list "v*")
+      echo "$ALL_TAGS"
+    }
+
+    function get_latest_tag_before_commit {
+      local ALL_TAGS=$(get_all_tags_before_commit)
+      local TAG=$(echo "$ALL_TAGS" | tail -n1)
+      echo "$TAG"
+    }
+
+
+# to be able to use *ci-util-funcs in templates e.g. .tpl-ci-kotlin
+.tpl-ci-utils:
+  before_script:
+    - *ci-util-funcs
+
+# Template to install helm release
+.helm-deploy:
+  extends:
+    - .tpl-helm3
+    - .helm-variables
+    - .version-variables
+  variables:
+    KUBE_TOKEN: $KUBE_TOKEN_DEV
+    HELM_CREATE_NAMESPACE: "false"
+    HELM_NAMESPACE_ANNOTATION: ""
+    # Can be overridden in global scope jobs (e.g. in review job)
+    HELM_UPGRADE_ADDITIONAL_GLOBAL_ARGS: ""
+    # Can be overridden in particular service job
+    HELM_UPGRADE_ADDITIONAL_ARGS: ""
+    KUBERNETES_CPU_REQUEST: '0.05'
+    # KUBERNETES_CPU_LIMIT: '0.1'
+    KUBERNETES_MEMORY_REQUEST: 128Mi
+    KUBERNETES_MEMORY_LIMIT: 256Mi
+    KUBERNETES_EPHEMERAL_STORAGE_REQUEST: 256Mi
+    KUBERNETES_EPHEMERAL_STORAGE_LIMIT: 512Gi
+  script:
+    - *ci-util-funcs
+    - CURRENT_APP_VERSION=$(get_current_commit_version)
+    - echo "CURRENT_APP_VERSION $CURRENT_APP_VERSION"
+    # Create namespace and annotate it with Rancher project ID if needed
+    - |
+      if [[ "$HELM_CREATE_NAMESPACE" == true ]] && ! kubectl get ns $HELM_DEPLOY_NAMESPACE; then
+        echo "Creating namespace $HELM_DEPLOY_NAMESPACE"
+        kubectl create ns $HELM_DEPLOY_NAMESPACE
+        if [ -n "$HELM_NAMESPACE_ANNOTATION" ]; then
+          echo "Annotating namespace with $HELM_NAMESPACE_ANNOTATION"
+          kubectl annotate ns $HELM_DEPLOY_NAMESPACE $HELM_NAMESPACE_ANNOTATION
+        fi
+      fi
+    - INGRESS_HOST=`echo "$CI_ENVIRONMENT_URL" | cut -d"/" -f3`
+    - INGRESS_PATH=`echo "$CI_ENVIRONMENT_URL" | cut -d"/" -f4-`
+    - echo "Installing release $HELM_RELEASE_NAME from chart $HELM_CHART_NAME"
+    - echo "With args $HELM_UPGRADE_ADDITIONAL_GLOBAL_ARGS $HELM_UPGRADE_ADDITIONAL_ARGS"
+    - echo "With ingress host=$INGRESS_HOST path=$INGRESS_PATH"
+    - helm upgrade --install --atomic $HELM_UPGRADE_ADDITIONAL_GLOBAL_ARGS $HELM_UPGRADE_ADDITIONAL_ARGS
+      --set ingress.hosts[0].host="$INGRESS_HOST"
+      --set ingress.hosts[0].paths[0]="$INGRESS_PATH"
+      --namespace="$HELM_DEPLOY_NAMESPACE"
+      --version="$CURRENT_APP_VERSION"
+      "$HELM_RELEASE_NAME"
+      "private/$HELM_CHART_NAME"
+
+sonar-scanner:
+  stage: lint
+  image: sonarsource/sonar-scanner-cli:4.6
+  extends:
+    - .branch-triggers-build
+  variables:
+    GIT_DEPTH: 0
+    KUBERNETES_CPU_REQUEST: '0.3'
+    # KUBERNETES_CPU_LIMIT: '0.5'
+    KUBERNETES_MEMORY_REQUEST: 1Gi
+    KUBERNETES_MEMORY_LIMIT: 1Gi
+    KUBERNETES_EPHEMERAL_STORAGE_REQUEST: 256Mi
+    KUBERNETES_EPHEMERAL_STORAGE_LIMIT: 512Gi
+  script:
+    - sonar-scanner -Dsonar.qualitygate.wait=true -Dsonar.projectKey="$CI_PROJECT_PATH"
+  allow_failure: true
+  needs: []
+
+# Calculate service version and write it to VERSION file
+.version-tpl:
+  stage: make-version
+  image: jnewland/git-and-stuff:v0.0.5
+  extends:
+    - .version-variables
+  variables:
+    DEBUG_VERSION: "true"
+    KUBERNETES_CPU_REQUEST: '0.05'
+    # KUBERNETES_CPU_LIMIT: '0.1'
+    KUBERNETES_MEMORY_REQUEST: 64Mi
+    KUBERNETES_MEMORY_LIMIT: 128Mi
+    KUBERNETES_EPHEMERAL_STORAGE_REQUEST: 256Mi
+    KUBERNETES_EPHEMERAL_STORAGE_LIMIT: 512Gi
+  script:
+    - *ci-util-funcs
+    # do not use `echo $(get_current_commit_version) | tee $APP_VERSION_FILE_PATH`
+    # as tee somehow runs before get_current_commit_version call and truncates the file
+    - VER=$(get_current_commit_version)
+    - |
+      if [ -z $VER ]; then
+        echo "Failed to get version"
+        exit 1
+      fi
+    - echo $VER | tee $APP_VERSION_FILE_PATH
+  artifacts:
+    name: "$CI_JOB_NAME-$CI_COMMIT_REF_SLUG"
+    paths:
+      - $APP_VERSION_FILE_PATH
+
+.version:
+  extends:
+    - .version-tpl
+    - .branch-triggers-build
+
+version-main-chart:
+  extends:
+    - .version
+    - .version-main-chart-variables
+
+# Job composes all artifacts from `version` stage in order to be able
+# to use all version files with single job dependency.
+# This job used as dependency in `helm-chart-main` stage.
+# This job shouldn't be blocking for all other jobs except `helm-chart-main`
+collect-versions:
+  stage: collect-versions
+  extends:
+    - .branch-triggers-build
+    - .version-variables
+  variables:
+    GIT_STRATEGY: none
+    KUBERNETES_CPU_REQUEST: '0.05'
+    # KUBERNETES_CPU_LIMIT: '0.1'
+    KUBERNETES_MEMORY_REQUEST: 64Mi
+    KUBERNETES_MEMORY_LIMIT: 128Mi
+    KUBERNETES_EPHEMERAL_STORAGE_REQUEST: 256Mi
+    KUBERNETES_EPHEMERAL_STORAGE_LIMIT: 512Gi
+  script:
+    - echo "Collecting all version files"
+  artifacts:
+    name: "$CI_JOB_NAME-$CI_COMMIT_REF_SLUG"
+    paths:
+      - "$APP_VERSION_FILE_NAME"
+      - "**/$APP_VERSION_FILE_NAME"
+      - "*/**/$APP_VERSION_FILE_NAME"
+
+# Build and publish docker image with kaniko
+.kaniko:
+  image:
+    name: kaniko-project/executor:debug-v1.3.0
+    entrypoint: [ "" ]
+  variables:
+    DOCKER_BUILD_ADDITIONAL_ARGS: ""
+    KUBERNETES_CPU_REQUEST: '0.1'
+    # KUBERNETES_CPU_LIMIT: '0.1'
+    KUBERNETES_MEMORY_REQUEST: 512Mi
+    KUBERNETES_MEMORY_LIMIT: 512Mi
+    KUBERNETES_EPHEMERAL_STORAGE_REQUEST: 256Mi
+    KUBERNETES_EPHEMERAL_STORAGE_LIMIT: 512Mi
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"username\":\"$CI_REGISTRY_USER\",\"password\":\"$CI_REGISTRY_PASSWORD\"}}}" > /kaniko/.docker/config.json
+    - echo "$DOCKER_REGISTRY_MIRROR_CERT" >> /kaniko/ssl/certs/additional-ca-cert-bundle.crt
+    # this image without git and bash so cant use $(get_current_commit_version)
+    - CI_REGISTRY_IMAGE_TAG=`cat $APP_VERSION_FILE_PATH`
+    - |
+      if [ -n "$DOCKERIGNORE_PATH" ]; then
+        cp $DOCKERIGNORE_PATH $DOCKER_CONTEXT_DIRPATH/.dockerignore
+      fi
+    - cd $DOCKER_CONTEXT_DIRPATH
+    - echo "building $CI_REGISTRY_IMAGE:$CI_REGISTRY_IMAGE_TAG"
+    - echo "DOCKER_BUILD_ADDITIONAL_ARGS=$DOCKER_BUILD_ADDITIONAL_ARGS"
+  script:
+    - /kaniko/executor
+      $DOCKER_BUILD_ADDITIONAL_ARGS
+      --log-timestamp
+      --skip-tls-verify
+      --registry-mirror $DOCKER_REGISTRY_MIRROR
+      --context .
+      --dockerfile $DOCKERFILE_PATH
+      --destination $CI_REGISTRY_IMAGE:$CI_REGISTRY_IMAGE_TAG
+
+# Build and publish docker image
+.docker:
+  stage: docker-image
+  extends:
+    - .kaniko
+    - .branch-triggers-build
+    - .version-variables
+    - .docker-variables
+  variables:
+    DOCKERFILE_PATH: Dockerfile
+    DOCKER_CONTEXT_DIRPATH: $SERVICE_DIRPATH
+    DOCKERIGNORE_PATH: ""
+
+# Package and publish helm chart
+.helm:
+  stage: helm-chart
+  extends:
+    - .tpl-helm3
+    - .helm-variables
+    - .version-variables
+    - .branch-triggers-build
+  variables:
+    HELM_NEED_DEPENDENCY_UPDATE: "false"
+    KUBERNETES_CPU_REQUEST: '0.1'
+    # KUBERNETES_CPU_LIMIT: '0.1'
+    KUBERNETES_MEMORY_REQUEST: 512Mi
+    KUBERNETES_MEMORY_LIMIT: 512Mi
+    KUBERNETES_EPHEMERAL_STORAGE_REQUEST: 256Mi
+    KUBERNETES_EPHEMERAL_STORAGE_LIMIT: 512Mi
+  script:
+    - *ci-util-funcs
+    - echo "HELM_CHART_PATH=$HELM_CHART_PATH"
+    - echo "HELM_CHART_NAME=$HELM_CHART_NAME"
+    - echo -e "\e[0Ksection_start:`date +%s`:build_deps\r\e[0KBuild dependencies"
+    - |
+      if [[ "$HELM_NEED_DEPENDENCY_UPDATE" == true ]]; then
+        helm dependency update "$HELM_CHART_PATH"
+      else
+        helm dependency build "$HELM_CHART_PATH"
+      fi
+    - echo -e "\e[0Ksection_end:`date +%s`:build_deps\r\e[0K"
+    - helm lint "$HELM_CHART_PATH"
+    - CURRENT_APP_VERSION=$(get_current_commit_version)
+    - CURRENT_CHART_VERSION=$CURRENT_APP_VERSION
+    - echo "CURRENT_CHART_VERSION=$CURRENT_APP_VERSION"
+    - echo "CURRENT_APP_VERSION=$CURRENT_APP_VERSION"
+    - helm package
+      --version=$CURRENT_APP_VERSION
+      --app-version=$CURRENT_APP_VERSION
+      "$HELM_CHART_PATH"
+    # Upload packaged chart to private repository
+    - curl -sSf -u $HELM_PRIVATE_REPOSITORY_USER:$HELM_PRIVATE_REPOSITORY_PASSWORD
+      --upload-file "$HELM_CHART_NAME-$CURRENT_APP_VERSION.tgz"
+      $HELM_PRIVATE_REPOSITORY
+
+helm-chart-main:
+  stage: helm-chart-main
+  extends:
+    - .helm
+    - .helm-main-chart-variables
+    - .version-main-chart-variables
+    - .branch-triggers-build
+  dependencies:
+    # Use all version files of changed services to build main-chart dependencies
+    - collect-versions
+  variables:
+    HELM_NEED_DEPENDENCY_UPDATE: "true"
+    KUBERNETES_CPU_REQUEST: '0.4'
+    # KUBERNETES_CPU_LIMIT: '0.5'
+    KUBERNETES_MEMORY_REQUEST: 512Mi
+    KUBERNETES_MEMORY_LIMIT: 512Mi
+    KUBERNETES_EPHEMERAL_STORAGE_REQUEST: 256Mi
+    KUBERNETES_EPHEMERAL_STORAGE_LIMIT: 512Mi
+  before_script:
+    - echo -e "\e[0Ksection_start:`date +%s`:helm_repo_up\r\e[0KHelm repo update"
+    - helm repo add private $HELM_PRIVATE_REPOSITORY
+    - helm repo update
+    - echo -e "\e[0Ksection_end:`date +%s`:helm_repo_up\r\e[0K"
+    # Set versions of main chart dependencies.
+    # Find all files with versions of services charts.
+    # Then iterate through each file and take version from file content and service name from dirname.
+    # Finally find and replace versions of each changed dependency from "*" to specific version from version file.
+    # Trick with replacing '\n' to '\r' is needed to replace multiline string with `sed`
+    - echo -e "\e[0Ksection_start:`date +%s`:patch_deps\r\e[0KPatch dependencies"
+    - |
+      HELM_CHART_YAML_PATH=$HELM_CHART_PATH/Chart.yaml
+      HELM_CHART_YAML_TMP_PATH=$HELM_CHART_YAML_PATH.tpm
+      while IFS= read -r path; do
+          DEP_NAME=$(echo "$(dirname $path)" | awk -F/ '{print $NF}')
+          DEP_VERSION=`cat $path`
+          echo "Patching dependency $DEP_NAME with version $DEP_VERSION"
+          cat $HELM_CHART_YAML_PATH \
+            | tr '\n' '\r' \
+            | sed -E "s/(- name\: $DEP_NAME\r    version\:) \"\*\"/\1 $DEP_VERSION/" \
+            | tr '\r' '\n' > $HELM_CHART_YAML_TMP_PATH
+          mv $HELM_CHART_YAML_TMP_PATH $HELM_CHART_YAML_PATH
+      done <<<$(find . -mindepth 2 -maxdepth 3 -name $APP_VERSION_FILE_NAME)
+    - echo -e "\e[0Ksection_end:`date +%s`:patch_deps\r\e[0K"
+
+.review-deploy:
+  stage: review
+  extends:
+    - .helm-deploy
+    - .helm-main-chart-variables
+    - .version-main-chart-variables
+  only:
+    refs:
+      - merge_requests
+  dependencies:
+    - collect-versions
+  variables:
+    HELM_DEPLOY_NAMESPACE: $CI_COMMIT_REF_SLUG
+    HELM_CREATE_NAMESPACE: "true"
+    HELM_NAMESPACE_ANNOTATION: $HELM_NAMESPACE_ANNOTATION_REVIEW
+
+# Try to install and immediately uninstall release 
+test-review-deploy:
+  extends:
+    - .review-deploy
+  variables:
+    HELM_DEPLOY_NAMESPACE: $CI_COMMIT_REF_SLUG-test
+    HELM_RELEASE_NAME: $CI_COMMIT_REF_SLUG-test
+  after_script:
+    - helm uninstall --namespace="$HELM_DEPLOY_NAMESPACE" "$HELM_RELEASE_NAME"
+    - kubectl delete ns $HELM_DEPLOY_NAMESPACE
+
+# Deploy review environment 
+review:
+  extends:
+    - .review-deploy
+  when: manual
+  environment:
+    name: review/$CI_COMMIT_REF_SLUG
+    url: http://ui.$CI_COMMIT_REF_SLUG.review.$KUBE_INGRESS_BASE_DOMAIN/
+    on_stop: stop_review
+    auto_stop_in: 2 days
+
+# Cleanup review environment
+stop_review:
+  stage: review
+  extends:
+    - .tpl-helm3
+    - .helm-main-chart-variables
+  only:
+    refs:
+      - merge_requests
+  dependencies: []
+  variables:
+    HELM_DEPLOY_NAMESPACE: $CI_COMMIT_REF_SLUG
+    KUBE_TOKEN: $KUBE_TOKEN_DEV
+    GIT_STRATEGY: none
+  script:
+    - helm uninstall --namespace="$HELM_DEPLOY_NAMESPACE" "$HELM_RELEASE_NAME"
+    - kubectl delete ns $HELM_DEPLOY_NAMESPACE
+  when: manual
+  environment:
+    name: review/$CI_COMMIT_REF_SLUG
+    action: stop
+
+# Deploy qa environment
+qa:
+  stage: qa
+  extends:
+    - .review-deploy
+    - .branch-triggers-deploy
+  when: manual
+  variables:
+    HELM_DEPLOY_NAMESPACE: qa-$CI_COMMIT_REF_SLUG
+    HELM_RELEASE_NAME: qa-$CI_COMMIT_REF_SLUG
+    HELM_NAMESPACE_ANNOTATION: $HELM_NAMESPACE_ANNOTATION_QA
+  environment:
+    name: qa/$CI_COMMIT_REF_SLUG
+    url: http://$CI_COMMIT_REF_SLUG.qa.$KUBE_INGRESS_BASE_DOMAIN/
+    on_stop: stop_qa
+
+# Cleanup qa environment
+stop_qa:
+  stage: qa
+  extends:
+    - stop_review
+    - .branch-triggers-deploy
+  variables:
+    HELM_DEPLOY_NAMESPACE: qa-$CI_COMMIT_REF_SLUG
+    HELM_RELEASE_NAME: qa-$CI_COMMIT_REF_SLUG
+  environment:
+    name: qa/$CI_COMMIT_REF_SLUG
+
+.staging:
+  stage: staging
+  extends:
+    - .helm-deploy
+  only:
+    refs:
+      - develop
+  variables:
+    HELM_DEPLOY_NAMESPACE: $KUBE_NAMESPACE
+    KUBE_TOKEN: $KUBE_TOKEN_STAGING
+    KUBERNETES_SERVICE_HOST: $KUBERNETES_HOST_STAGING
+    KUBERNETES_SERVICE_PORT: $KUBERNETES_PORT_STAGING
+  environment:
+    name: staging/$SERVICE_NAME
+    url: http://$SERVICE_NAME.$KUBE_INGRESS_BASE_DOMAIN_STAGING/
+
+.production:
+  stage: production
+  extends:
+    - .helm-deploy
+  variables:
+    HELM_DEPLOY_NAMESPACE: $KUBE_NAMESPACE
+    KUBE_TOKEN: $KUBE_TOKEN_PRODUCTION
+    KUBERNETES_SERVICE_HOST: $KUBERNETES_HOST_PRODUCTION
+    KUBERNETES_SERVICE_PORT: $KUBERNETES_PORT_PRODUCTION
+  only:
+    refs:
+      - master
+  environment:
+    name: production/$SERVICE_NAME
+    url: http://$SERVICE_NAME.$KUBE_INGRESS_BASE_DOMAIN_PRODUCTION/

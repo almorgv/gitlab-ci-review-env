@@ -1,0 +1,51 @@
+.tpl-variables-service-a:
+  variables:
+    SERVICE_DIRPATH: "service-a"
+    SERVICE_NAME: "service-a"
+
+.tpl-triggers-service-a:
+  only:
+    changes:
+      - 'service-a/**/*'
+
+.tpl-service-a:
+  extends:
+    - .tpl-variables-service-a
+    - .tpl-triggers-service-a
+
+service-a-version:
+  extends:
+    - .version
+    - .tpl-service-a
+
+service-a-lint:
+  extends:
+    - .kotlin-lint
+    - .tpl-service-a
+  needs: []
+
+service-a-build:
+  extends:
+    - .kotlin-build
+    - .tpl-service-a
+  needs:
+    - service-a-lint
+
+service-a-helm:
+  extends:
+    - .helm
+    - .tpl-service-a
+  needs:
+    - service-a-build
+
+service-a-staging:
+  extends:
+    - .staging
+    - .tpl-service-a
+  needs:
+    - service-a-helm
+
+service-a-production:
+  extends:
+    - .production
+    - .tpl-service-a

@@ -1,0 +1,43 @@
+###############
+# ATTENTION
+###############
+# At the moment `nameOverride` and `fullnameOverride` must be set for every dependency to exclude release name from k8s service names.
+# And `nameOverride` must be set for intersecting transitive dependencies (e.g. multiple transitive dependencies on postgresql).
+# Primarily this is required to avoid name clashing in case of dependencies intersection.
+# E.g. ServiceA depends on postgresql and ServiceB also depends on postgresql.
+# And this chart depends on ServiceA and ServiceB.
+# When this chart is trying to be installed with some name (e.g. 'system') then helm trying
+# to create two k8s services with the same exact name 'system-postgresql' and this is there we got a conflict.
+# This is happening because names always set by this way:
+#  name: {{ template "postgresql.fullname" . }}
+# And chart fullname defined in default helpers includes only release name and chart name:
+#   {{- $name := default .Chart.Name .Values.nameOverride -}}
+#   {{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+# Furthermore override is needed to correspondence between hostnames in default chart values and created k8s services
+
+kafka:
+  fullnameOverride: kafka
+  replicas: 1
+  persistence:
+    enabled: false
+  zookeeper:
+    replicaCount: 1
+    fullnameOverride: kafka-zookeeper
+
+service-a:
+  fullnameOverride: service-a
+  postgresql:
+    nameOverride: service-b-postgresql
+    fullnameOverride: service-b-postgresql
+    enabled: true
+    persistence:
+      enabled: false
+
+service-b:
+  fullnameOverride: service-b
+  postgresql:
+    nameOverride: service-b-postgresql
+    fullnameOverride: service-b-postgresql
+    enabled: true
+    persistence:
+      enabled: false
